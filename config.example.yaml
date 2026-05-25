@@ -1,0 +1,26 @@
+# Warehouse Operations CLI Configuration
+# Copy this to config.yaml or ~/.wh-ops/config.yaml and update values
+
+google_auth:
+  # Path to Google OAuth token (from google-docs-mcp or manual setup)
+  token_path: "~/.config/google-docs-mcp/token.json"
+
+spreadsheets:
+  # WH Delivery Rate sheet (contains RAW, FC_DOD_RAW_NEW, New_Summary)
+  delivery_rate: "1c936V1WcrQGJsfd74ntFp3zXeHmgX0nKo3cq-3j-P4E"
+
+warehouses:
+  - GURGAON_WH
+  - LUCKNOW_NEW_WH
+  - SNP_WH
+  - VARANASI_WH
+  - BAHADURGARH_WH
+  - DADRI_WH
+  - PATNA_WH
+
+output_dir: "~/Desktop/warehouse-dashboards/"
+
+scripts:
+  xb: "~/Desktop/warehouse-dashboards/refresh_xb_cost_dashboard.py"
+  jit: "~/Desktop/warehouse-dashboards/refresh_delivery_dashboard.py"
+  fm_html: "~/Desktop/warehouse-dashboards/b2b-billing-model.html"
