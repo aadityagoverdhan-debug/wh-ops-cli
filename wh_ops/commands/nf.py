@@ -1,252 +1,243 @@
-"""Tech NF + Tech Red + WH Red bucket analysis with cancellation reason breakdown."""
+"""Tech NF + Tech Red + WH Red bucket analysis.
+
+Reads header values directly from New_Summary sheet rows.
+Cancellation reason drilldowns from FC_DOD_RAW_NEW (till 95% cumulative).
+Always prints the summary table to stdout.
+"""
 
 import os
-from datetime import datetime, date
-from wh_ops.utils import serial_to_date, fmt_pct, fmt_gmv, arrow, sf, si, print_row
+from datetime import datetime, date, timedelta
+from collections import defaultdict
+from wh_ops.utils import serial_to_date, fmt_pct, sf, si
 from wh_ops.config import load_config
 from wh_ops.auth import get_sheets_service
 from wh_ops.sheets import read_sheet, read_sheet_chunked
 
 WH_NF_REASONS = {'NOT_FOUND', 'AUDITED_SKU_NF'}
-NF_KNOWN_SUB = {'INVENTORY_SYNC_ERROR', 'REDISPATCHED_INVENTORY_OOS', 'INVENTORY_MISSING_REDISPATCH'}
-PERIODS = ['Apr-26', 'Apr_MTD', 'May_MTD', 'May_L7']
+MAIN_NF_BUCKETS = {'INVENTORY_SYNC_ERROR', 'REDISPATCHED_INVENTORY_OOS'}
+
+# New_Summary row indices (0-indexed in the full sheet array)
+ROWS = {
+    'Overall_RED': 85,
+    'Tech_Red_sub': 133,
+    'WH_Red': 93,
+    'INV_SYNC': 52,
+    'REDISP_OOS': 60,
+    'STN_ADMIN_NF': 68,
+    'NF_Others': 76,
+    'EDD_Tech': 141,
+    'SI_FR': 149,
+    'Redispatch': 157,
+    'TR_Others': 165,
+    'REPROCESS': 173,
+    'EDD_WH': 101,
+    'Pick': 109,
+    'Pack': 117,
+    'Dispatch': 125,
+}
 
 
-def filter_by_date(rows, month, min_day=1, max_day=31):
-    out = []
-    for r in rows:
-        dt = serial_to_date(r[0])
-        if dt and dt.year == 2026 and dt.month == month and min_day <= dt.day <= max_day:
-            out.append(r)
-    return out
-
-
-def compute_from_raw(raw_rows):
-    """Compute WH Red sub-buckets and Tech_Red sub-buckets from RAW sheet."""
-    base = sum(sf(r[6]) for r in raw_rows)
-    if base == 0:
-        return None
-    return {
-        'base': base,
-        'pick': sum(sf(r[11]) for r in raw_rows) / base * 100,
-        'pack': sum(sf(r[12]) for r in raw_rows) / base * 100,
-        'dispatch': sum(sf(r[13]) for r in raw_rows) / base * 100,
-        'si_fr': sum(sf(r[14]) for r in raw_rows) / base * 100,
-        'redispatch': sum(sf(r[17]) for r in raw_rows) / base * 100,
-    }
-
-
-def compute_from_fc(fc_rows, base):
-    """Compute Tech NF reasons + Tech Red Others from FC_DOD_RAW_NEW."""
-    tech_nf_by_r = {}
-    tr_others_by_r = {}
-
-    for r in fc_rows:
-        while len(r) < 27:
-            r.append('')
-        gmv = sf(r[24])
-        reason = r[2]
-
-        # Tech NF: nf_flag=1, exclude WH NF reasons
-        if si(r[4]) == 1 and reason not in WH_NF_REASONS:
-            tech_nf_by_r[reason] = tech_nf_by_r.get(reason, 0) + gmv
-
-        # Tech Red Others (fulf formula):
-        # nf=0, ntf=0, early_rp=0, fulf=1, batch=0, reason!=UPDATE_EDD
-        if (si(r[4]) == 0 and si(r[5]) == 0 and si(r[7]) == 0 and
-                si(r[10]) == 1 and si(r[12]) == 0 and
-                reason != 'UPDATE_EDD_FOR_UNPACKED_ORDERS'):
-            tr_others_by_r[reason] = tr_others_by_r.get(reason, 0) + gmv
-
-    tech_nf_total = sum(tech_nf_by_r.values())
-    inv_sync = tech_nf_by_r.get('INVENTORY_SYNC_ERROR', 0)
-    redisp_oos = sum(tech_nf_by_r.get(r, 0) for r in
-                     ['REDISPATCHED_INVENTORY_OOS', 'INVENTORY_MISSING_REDISPATCH'])
-    others_nf = tech_nf_total - inv_sync - redisp_oos
-    tr_others_total = sum(tr_others_by_r.values())
-
-    nf_oth = {k: v / base * 100 for k, v in tech_nf_by_r.items() if k not in NF_KNOWN_SUB}
-    tr_oth = {k: v / base * 100 for k, v in tr_others_by_r.items()}
-
-    return {
-        'tech_nf': tech_nf_total / base * 100,
-        'inv_sync': inv_sync / base * 100,
-        'redisp_oos': redisp_oos / base * 100,
-        'others_nf': others_nf / base * 100,
-        'tr_others': tr_others_total / base * 100,
-        'nf_oth_reasons': nf_oth,
-        'tr_oth_reasons': tr_oth,
-    }
-
-
-def get_edd_from_sheet(service, spreadsheet_id):
-    """Read EDD change values from New_Summary (small, stable)."""
+def get_sheet_val(summary_rows, row_idx, col):
+    """Get value from New_Summary as percentage (sheet stores fractions)."""
+    if row_idx >= len(summary_rows):
+        return 0
+    row = summary_rows[row_idx]
+    if col >= len(row):
+        return 0
     try:
-        ns = read_sheet(service, spreadsheet_id, 'New_Summary!A20:Y213')
-        def pv(v):
-            try: return float(str(v).replace('%', ''))
-            except: return 0.0
-        def get_ns(idx):
-            if idx >= len(ns):
-                return {p: 0 for p in PERIODS}
-            row = ns[idx]
-            apr = pv(row[2]) if len(row) > 2 else 0
-            apr_mtd = pv(row[3]) if len(row) > 3 else 0
-            may_mtd = pv(row[4]) if len(row) > 4 else 0
-            l7_vals = [pv(row[i]) if len(row) > i else 0 for i in range(6, 13)]
-            l7 = sum(l7_vals) / len(l7_vals) if l7_vals else 0
-            return {'Apr-26': apr, 'Apr_MTD': apr_mtd, 'May_MTD': may_mtd, 'May_L7': l7}
-        return get_ns(122), get_ns(82)  # EDD Tech (row 142), EDD WH (row 102)
-    except Exception:
-        # Fallback: small values
-        z = {p: 0 for p in PERIODS}
-        return z, z
+        return float(row[col]) * 100
+    except (ValueError, TypeError):
+        return 0
+
+
+def get_4cols(summary_rows, row_idx):
+    """Return dict with apr, apr_mtd, may, may_l7 from New_Summary."""
+    l7_vals = [get_sheet_val(summary_rows, row_idx, c) for c in range(5, 12)]
+    return {
+        'apr': get_sheet_val(summary_rows, row_idx, 2),
+        'apr_mtd': get_sheet_val(summary_rows, row_idx, 3),
+        'may': get_sheet_val(summary_rows, row_idx, 4),
+        'may_l7': sum(l7_vals) / 7,
+    }
+
+
+def reasons_till_95(reason_dict):
+    """Get reasons covering 95% cumulative of total."""
+    total = sum(reason_dict.values())
+    if total == 0:
+        return []
+    sorted_r = sorted(reason_dict.items(), key=lambda x: x[1], reverse=True)
+    result = []
+    cumul = 0
+    for r, g in sorted_r:
+        result.append(r)
+        cumul += g
+        if cumul / total >= 0.95:
+            break
+    return result
 
 
 def run(args):
     config = load_config(getattr(args, 'config', None))
     sid = config['spreadsheets']['delivery_rate']
 
-    # Determine cutoff date
+    cutoff = date.today() - timedelta(days=1)
     if hasattr(args, 'date') and args.date:
         cutoff = datetime.strptime(args.date, '%Y-%m-%d').date()
-    else:
-        cutoff = date.today() - __import__('datetime').timedelta(days=1)
 
     cutoff_day = cutoff.day
-    cutoff_month = cutoff.month
+    l7_start = max(1, cutoff_day - 6)
     print(f"Running Tech NF + Red analysis till {cutoff.strftime('%Y-%m-%d')}...")
-    print(f"Cutoff: May 1-{cutoff_day}, L7 = May {cutoff_day-6}-{cutoff_day}")
 
-    # Auth
     service = get_sheets_service(config['google_auth']['token_path'])
 
-    # Read RAW sheet (1595 rows)
-    print("Reading RAW sheet...")
-    raw_all = read_sheet(service, sid, 'RAW!A1:W1595', 'UNFORMATTED_VALUE')
-    raw_header = raw_all[0] if raw_all else []
-    raw_data = raw_all[1:] if len(raw_all) > 1 else []
-    # Pad rows
-    for r in raw_data:
-        while len(r) < 23: r.append('')
-    print(f"  RAW: {len(raw_data)} rows")
+    # --- Read New_Summary (200 rows) ---
+    print("Reading New_Summary...")
+    summary_rows = read_sheet(service, sid, 'New_Summary!A1:AO200', 'UNFORMATTED_VALUE')
+    print(f"  New_Summary: {len(summary_rows)} rows")
 
-    # Read FC_DOD_RAW_NEW in chunks
-    print("Reading FC_DOD_RAW_NEW sheet (chunked)...")
-    fc_data = read_sheet_chunked(service, sid, 'FC_DOD_RAW_NEW', 24026, cols='A:AA')
+    # Extract all header values from New_Summary
+    d = {k: get_4cols(summary_rows, v) for k, v in ROWS.items()}
+
+    # Computed rows (no direct row in sheet)
+    periods = ['apr', 'apr_mtd', 'may', 'may_l7']
+    tech_nf = {p: d['INV_SYNC'][p] + d['REDISP_OOS'][p] + d['STN_ADMIN_NF'][p] + d['NF_Others'][p] for p in periods}
+    tech_red = {p: tech_nf[p] + d['Tech_Red_sub'][p] for p in periods}
+
+    # --- Read FC_DOD_RAW_NEW for cancellation reasons ---
+    print("Reading FC_DOD_RAW_NEW (chunked)...")
+    fc_data = read_sheet_chunked(service, sid, 'FC_DOD_RAW_NEW', 27000, cols='A:AA')
     for r in fc_data:
-        while len(r) < 27: r.append('')
+        while len(r) < 27:
+            r.append('')
     print(f"  FC_DOD: {len(fc_data)} rows")
 
-    # Read EDD values from New_Summary
-    print("Reading EDD change values from New_Summary...")
-    edd_tech, edd_wh = get_edd_from_sheet(service, sid)
+    # Read RAW for base_gmv (needed for FC_DOD reason %) 
+    print("Reading RAW...")
+    raw_all = read_sheet(service, sid, 'RAW!A1:W1600', 'UNFORMATTED_VALUE')
+    raw_data = raw_all[1:] if len(raw_all) > 1 else []
+    print(f"  RAW: {len(raw_data)} rows")
 
-    # Filter periods
-    l7_start = max(1, cutoff_day - 6)
-    raw_periods = [
-        filter_by_date(raw_data, 4),                          # Apr full
-        filter_by_date(raw_data, 4, max_day=cutoff_day),      # Apr MTD
-        filter_by_date(raw_data, cutoff_month, max_day=cutoff_day),  # May MTD
-        filter_by_date(raw_data, cutoff_month, min_day=l7_start, max_day=cutoff_day),  # L7
-    ]
-    fc_periods = [
-        filter_by_date(fc_data, 4),
-        filter_by_date(fc_data, 4, max_day=cutoff_day),
-        filter_by_date(fc_data, cutoff_month, max_day=cutoff_day),
-        filter_by_date(fc_data, cutoff_month, min_day=l7_start, max_day=cutoff_day),
-    ]
+    # Date serials
+    APR_START, APR_END, MAY_START = 46113, 46142, 46143
+    TODAY_SERIAL = APR_START + (cutoff - date(2026, 4, 1)).days
+    APR_MTD_END = APR_START + cutoff_day - 1
+    MAY_L7_START = TODAY_SERIAL - 6
 
-    # Compute
-    raw_results = [compute_from_raw(rp) for rp in raw_periods]
-    fc_results = [compute_from_fc(fp, raw_results[i]['base']) for i, fp in enumerate(fc_periods)]
+    def in_period(serial, p):
+        if p == 'apr': return APR_START <= serial <= APR_END
+        elif p == 'apr_mtd': return APR_START <= serial <= APR_MTD_END
+        elif p == 'may': return MAY_START <= serial <= TODAY_SERIAL
+        elif p == 'may_l7': return MAY_L7_START <= serial <= TODAY_SERIAL
+        return False
 
-    def v(key, source='raw'):
-        data = raw_results if source == 'raw' else fc_results
-        return {p: data[i][key] for i, p in enumerate(PERIODS)}
+    # Base GMV from RAW
+    base_gmv = defaultdict(float)
+    for row in raw_data:
+        if len(row) < 7:
+            continue
+        try:
+            serial = int(row[0])
+        except (ValueError, TypeError):
+            continue
+        gmv = sf(row[6])
+        for p in periods:
+            if in_period(serial, p):
+                base_gmv[p] += gmv
 
-    # Build buckets
-    pick_v = v('pick'); pack_v = v('pack'); dispatch_v = v('dispatch')
-    si_fr_v = v('si_fr'); redispatch_v = v('redispatch')
-    tech_nf_v = v('tech_nf', 'fc'); inv_sync_v = v('inv_sync', 'fc')
-    redisp_oos_v = v('redisp_oos', 'fc'); others_nf_v = v('others_nf', 'fc')
-    tr_others_v = v('tr_others', 'fc')
+    # FC_DOD reason aggregation
+    nf_others_by_reason = defaultdict(lambda: defaultdict(float))
+    tr_others_by_reason = defaultdict(lambda: defaultdict(float))
 
-    tech_red_sub = {p: edd_tech[p] + si_fr_v[p] + redispatch_v[p] + tr_others_v[p] for p in PERIODS}
-    tech_red_full = {p: tech_nf_v[p] + tech_red_sub[p] for p in PERIODS}
-    wh_red = {p: edd_wh[p] + pick_v[p] + pack_v[p] + dispatch_v[p] for p in PERIODS}
-    overall_red = {p: tech_red_full[p] + wh_red[p] for p in PERIODS}
+    for row in fc_data:
+        try:
+            serial = int(row[0])
+        except (ValueError, TypeError):
+            continue
+        if serial < APR_START or serial > TODAY_SERIAL:
+            continue
 
-    # Print
-    output_lines = []
-    def p(s=""):
+        reason = str(row[2]) if row[2] else ''
+        nf_flag = si(row[4])
+        ntf_flag = si(row[5])
+        early_rp = si(row[7])
+        fulf_flag = si(row[10])
+        batch_flag = si(row[12])
+        gmv = sf(row[24])
+
+        for p in periods:
+            if not in_period(serial, p):
+                continue
+            # NF Others (exclude WH NF and main buckets)
+            if nf_flag == 1 and reason not in WH_NF_REASONS and reason not in MAIN_NF_BUCKETS:
+                nf_others_by_reason[p][reason] += gmv
+            # Tech Red Others
+            if (nf_flag == 0 and ntf_flag == 0 and early_rp == 0 and
+                    fulf_flag == 1 and batch_flag == 0 and
+                    reason != 'UPDATE_EDD_FOR_UNPACKED_ORDERS'):
+                tr_others_by_reason[p][reason] += gmv
+
+    # Reasons till 95% (use May MTD to determine which to show)
+    nf_oth_reasons = reasons_till_95(nf_others_by_reason['may'])
+    tr_oth_reasons = reasons_till_95(tr_others_by_reason['may'])
+
+    def pct(num, den):
+        return (num / den * 100) if den else 0
+
+    # --- Output ---
+    output = []
+    def p(s=''):
         print(s)
-        output_lines.append(s)
+        output.append(s)
 
-    p("=" * 100)
-    p(f"TECH NF + TECH RED + WH RED — Bucket Analysis")
-    p(f"MTD till {cutoff.strftime('%b %d')} | L7 = {cutoff.strftime('%b')} {l7_start}-{cutoff_day}")
-    p("=" * 100)
-    hdr = " ".join(f"{p_:>10s}" for p_ in PERIODS)
-    p(f"\n  {'':55s} {hdr}")
-    p("  " + "─" * 95)
+    def fmt(val):
+        return f"{val:.2f}%"
 
-    def row(label, d, indent=0):
-        pfx = "  " * indent; name = f"{pfx}{label}"
-        vals = " ".join(f"{fmt_pct(d[p_]):>10s}" for p_ in PERIODS)
-        p(f"  {name:55s} {vals}")
+    def line(label, vals):
+        return (f"{label:>45} {fmt(vals['apr']):>12} {fmt(vals['apr_mtd']):>12}"
+                f" {fmt(vals['may']):>12} {fmt(vals['may_l7']):>12}")
 
-    row("Overall Red", overall_red)
+    p('=' * 100)
+    p('TECH NF + TECH RED + WH RED — Bucket Analysis')
+    p(f'MTD till {cutoff.strftime("%b %d")} | L7 = {cutoff.strftime("%b")} {l7_start}-{cutoff_day}')
+    p('=' * 100)
     p()
-    row("Tech Red", tech_red_full)
+    p(f"{'':>45} {'Apr-26':>12} {'Apr_MTD':>12} {'May_MTD':>12} {'May_L7':>12}")
+    sep = chr(9472) * 95
+    p(sep)
+    p(line('Overall Red', d['Overall_RED']))
+    p(line('Tech Red', tech_red))
+    p(line('Tech NF', tech_nf))
+    p(line('INVENTORY_SYNC_ERROR', d['INV_SYNC']))
+    p(line('REDISPATCHED_INVENTORY_OOS', d['REDISP_OOS']))
+    p(line('Others', d['NF_Others']))
     p()
-    row("Tech NF", tech_nf_v, indent=1)
-    row("INVENTORY_SYNC_ERROR", inv_sync_v, indent=2)
-    row("REDISPATCHED_INVENTORY_OOS", redisp_oos_v, indent=2)
-    row("Others", others_nf_v, indent=2)
+    p(f"{'Tech NF Others (till 95%):':>45}")
+    for r in nf_oth_reasons:
+        vals = {pp: pct(nf_others_by_reason[pp].get(r, 0), base_gmv[pp]) for pp in periods}
+        p(line(r, vals))
     p()
-    p("      Tech NF 'Others' — cancellation reason split:")
-    all_nf_r = set()
-    for i in range(4):
-        all_nf_r.update(fc_results[i]['nf_oth_reasons'].keys())
-    for reason in sorted(all_nf_r, key=lambda r: -(fc_results[2]['nf_oth_reasons'].get(r, 0))):
-        vals = {per: fc_results[i]['nf_oth_reasons'].get(reason, 0) for i, per in enumerate(PERIODS)}
-        if max(vals.values()) >= 0.004:
-            row(reason, vals, indent=3)
+    p(line('Tech_Red', d['Tech_Red_sub']))
+    p(line('EDD changed - w/o batch generation - Tech Led', d['EDD_Tech']))
+    p(line('Redispatch', d['Redispatch']))
+    p(line('REPROCESS_WH_MH_CHANGE', d['REPROCESS']))
     p()
+    p(f"{'Tech_Red Others (till 95%):':>45}")
+    for r in tr_oth_reasons:
+        vals = {pp: pct(tr_others_by_reason[pp].get(r, 0), base_gmv[pp]) for pp in periods}
+        p(line(r, vals))
+    p()
+    p(line('WH Red', d['WH_Red']))
+    p(line('EDD changed - w/o batch generation - WH Led', d['EDD_WH']))
+    p(line('Pick Miss', d['Pick']))
+    p(line('Pack Miss', d['Pack']))
+    p(line('Dispatch Miss_Overall', d['Dispatch']))
+    p(sep)
 
-    row("Tech_Red", tech_red_sub, indent=1)
-    row("EDD changed - w/o batch generation - Tech Led", edd_tech, indent=2)
-    row("Redispatch", redispatch_v, indent=2)
-    row("Others (fulf formula)", tr_others_v, indent=2)
-    row("Soft Inventory / Fill rate", si_fr_v, indent=2)
-    p()
-    p("      Tech_Red 'Others' — cancellation reason split:")
-    all_tr_r = set()
-    for i in range(4):
-        all_tr_r.update(fc_results[i]['tr_oth_reasons'].keys())
-    for reason in sorted(all_tr_r, key=lambda r: -(fc_results[2]['tr_oth_reasons'].get(r, 0))):
-        vals = {per: fc_results[i]['tr_oth_reasons'].get(reason, 0) for i, per in enumerate(PERIODS)}
-        if max(vals.values()) >= 0.003:
-            row(reason, vals, indent=3)
-    p()
-
-    row("WH Red", wh_red)
-    row("EDD changed - w/o batch generation - WH Led", edd_wh, indent=1)
-    row("Pick Miss", pick_v, indent=1)
-    row("Pack Miss", pack_v, indent=1)
-    row("Dispatch Miss_Overall", dispatch_v, indent=1)
-
-    p()
-    p("  " + "─" * 95)
-    p(f"\n  Verification ({PERIODS[2]}):")
-    p(f"  Overall Red ({fmt_pct(overall_red[PERIODS[2]])}) = Tech Red ({fmt_pct(tech_red_full[PERIODS[2]])}) + WH Red ({fmt_pct(wh_red[PERIODS[2]])})")
-    p(f"  Tech Red ({fmt_pct(tech_red_full[PERIODS[2]])}) = Tech NF ({fmt_pct(tech_nf_v[PERIODS[2]])}) + Tech_Red ({fmt_pct(tech_red_sub[PERIODS[2]])})")
-
-    # Save to file
+    # Save
     outdir = config['output_dir']
     os.makedirs(outdir, exist_ok=True)
     outfile = os.path.join(outdir, f"tech_nf_red_analysis_{cutoff.strftime('%b%d').lower()}.txt")
     with open(outfile, 'w') as f:
-        f.write('\n'.join(output_lines) + '\n')
-    p(f"\n  Saved to: {outfile}")
+        f.write('\n'.join(output) + '\n')
+    p(f"\nSaved to: {outfile}")
