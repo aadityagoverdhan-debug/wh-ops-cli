@@ -1,9 +1,10 @@
 """Tech NF + Tech Red + WH Red bucket analysis.
 
 Reads sub-bucket values from New_Summary sheet rows.
-Overall Red and Tech Red are COMPUTED from sub-buckets (not read from sheet).
-Cancellation reason drilldowns from FC_DOD_RAW_NEW (till 95% cumulative).
-Always prints the summary table to stdout.
+Overall Red and Tech Red are COMPUTED from sub-buckets.
+Reason drilldowns from FC_DOD_RAW_NEW, SCALED to parent Others bucket.
+REPROCESS_WH_MH_CHANGE is inside Others — never standalone.
+Always prints the summary table. Asks before saving.
 """
 
 import os
@@ -17,18 +18,16 @@ from wh_ops.sheets import read_sheet, read_sheet_chunked
 WH_NF_REASONS = {'NOT_FOUND', 'AUDITED_SKU_NF'}
 MAIN_NF_BUCKETS = {'INVENTORY_SYNC_ERROR', 'REDISPATCHED_INVENTORY_OOS'}
 
-# New_Summary row indices (0-indexed in the full sheet array)
-# NOTE: Do NOT use Overall_RED (row 85) — it doesn't match sub-bucket sum
 ROWS = {
     'Tech_Red_sub': 133,
     'WH_Red': 93,
     'INV_SYNC': 52,
     'REDISP_OOS': 60,
-    'STN_ADMIN_NF': 68,
+    'STN': 68,
     'NF_Others': 76,
     'EDD_Tech': 141,
     'Redispatch': 157,
-    'REPROCESS': 173,
+    'TR_Others': 165,
     'EDD_WH': 101,
     'Pick': 109,
     'Pack': 117,
@@ -37,7 +36,6 @@ ROWS = {
 
 
 def get_sheet_val(summary_rows, row_idx, col):
-    """Get value from New_Summary as percentage (sheet stores fractions)."""
     if row_idx >= len(summary_rows):
         return 0
     row = summary_rows[row_idx]
@@ -50,7 +48,6 @@ def get_sheet_val(summary_rows, row_idx, col):
 
 
 def get_4cols(summary_rows, row_idx):
-    """Return dict with apr, apr_mtd, may, may_l7 from New_Summary."""
     l7_vals = [get_sheet_val(summary_rows, row_idx, c) for c in range(5, 12)]
     return {
         'apr': get_sheet_val(summary_rows, row_idx, 2),
@@ -61,7 +58,6 @@ def get_4cols(summary_rows, row_idx):
 
 
 def reasons_till_95(reason_dict):
-    """Get reasons covering 95% cumulative of total."""
     total = sum(reason_dict.values())
     if total == 0:
         return []
@@ -74,6 +70,13 @@ def reasons_till_95(reason_dict):
         if cumul / total >= 0.95:
             break
     return result
+
+
+def scaled_reason_val(reason_gmv, total_gmv, sheet_others_val):
+    """Scale FC_DOD reason so all reasons sum to sheet's Others value."""
+    if total_gmv == 0:
+        return 0
+    return (reason_gmv / total_gmv) * sheet_others_val
 
 
 def run(args):
@@ -90,33 +93,26 @@ def run(args):
 
     service = get_sheets_service(config['google_auth']['token_path'])
 
-    # --- Read New_Summary (200 rows) ---
+    # Read New_Summary
     print("Reading New_Summary...")
     summary_rows = read_sheet(service, sid, 'New_Summary!A1:AO200', 'UNFORMATTED_VALUE')
     print(f"  New_Summary: {len(summary_rows)} rows")
 
-    # Extract sub-bucket values from New_Summary
     periods = ['apr', 'apr_mtd', 'may', 'may_l7']
     d = {k: get_4cols(summary_rows, v) for k, v in ROWS.items()}
 
-    # COMPUTED rows (MUST compute from sub-buckets, not read from sheet)
-    tech_nf = {p: d['INV_SYNC'][p] + d['REDISP_OOS'][p] + d['STN_ADMIN_NF'][p] + d['NF_Others'][p] for p in periods}
+    # COMPUTED rows
+    tech_nf = {p: d['INV_SYNC'][p] + d['REDISP_OOS'][p] + d['STN'][p] + d['NF_Others'][p] for p in periods}
     tech_red = {p: tech_nf[p] + d['Tech_Red_sub'][p] for p in periods}
     overall_red = {p: tech_red[p] + d['WH_Red'][p] for p in periods}
 
-    # --- Read FC_DOD_RAW_NEW for cancellation reasons ---
+    # Read FC_DOD_RAW_NEW
     print("Reading FC_DOD_RAW_NEW (chunked)...")
     fc_data = read_sheet_chunked(service, sid, 'FC_DOD_RAW_NEW', 27000, cols='A:AA')
     for r in fc_data:
         while len(r) < 27:
             r.append('')
     print(f"  FC_DOD: {len(fc_data)} rows")
-
-    # Read RAW for base_gmv (needed for FC_DOD reason %)
-    print("Reading RAW...")
-    raw_all = read_sheet(service, sid, 'RAW!A1:W1600', 'UNFORMATTED_VALUE')
-    raw_data = raw_all[1:] if len(raw_all) > 1 else []
-    print(f"  RAW: {len(raw_data)} rows")
 
     # Date serials
     APR_START, APR_END, MAY_START = 46113, 46142, 46143
@@ -131,23 +127,11 @@ def run(args):
         elif p == 'may_l7': return MAY_L7_START <= serial <= TODAY_SERIAL
         return False
 
-    # Base GMV from RAW
-    base_gmv = defaultdict(float)
-    for row in raw_data:
-        if len(row) < 7:
-            continue
-        try:
-            serial = int(row[0])
-        except (ValueError, TypeError):
-            continue
-        gmv = sf(row[6])
-        for p in periods:
-            if in_period(serial, p):
-                base_gmv[p] += gmv
-
     # FC_DOD reason aggregation
-    nf_others_by_reason = defaultdict(lambda: defaultdict(float))
-    tr_others_by_reason = defaultdict(lambda: defaultdict(float))
+    nf_oth_gmv = defaultdict(lambda: defaultdict(float))
+    nf_oth_total = defaultdict(float)
+    tr_oth_gmv = defaultdict(lambda: defaultdict(float))
+    tr_oth_total = defaultdict(float)
 
     for row in fc_data:
         try:
@@ -168,21 +152,17 @@ def run(args):
         for p in periods:
             if not in_period(serial, p):
                 continue
-            # NF Others (exclude WH NF and main buckets)
             if nf_flag == 1 and reason not in WH_NF_REASONS and reason not in MAIN_NF_BUCKETS:
-                nf_others_by_reason[p][reason] += gmv
-            # Tech Red Others
+                nf_oth_gmv[p][reason] += gmv
+                nf_oth_total[p] += gmv
             if (nf_flag == 0 and ntf_flag == 0 and early_rp == 0 and
                     fulf_flag == 1 and batch_flag == 0 and
                     reason != 'UPDATE_EDD_FOR_UNPACKED_ORDERS'):
-                tr_others_by_reason[p][reason] += gmv
+                tr_oth_gmv[p][reason] += gmv
+                tr_oth_total[p] += gmv
 
-    # Reasons till 95% (use May MTD to determine which to show)
-    nf_oth_reasons = reasons_till_95(nf_others_by_reason['may'])
-    tr_oth_reasons = reasons_till_95(tr_others_by_reason['may'])
-
-    def pct(num, den):
-        return (num / den * 100) if den else 0
+    nf_oth_reasons = reasons_till_95(nf_oth_gmv['may'])
+    tr_oth_reasons = reasons_till_95(tr_oth_gmv['may'])
 
     # --- Output ---
     output = []
@@ -214,17 +194,17 @@ def run(args):
     p()
     p(f"{'Tech NF Others (till 95%):':>45}")
     for r in nf_oth_reasons:
-        vals = {pp: pct(nf_others_by_reason[pp].get(r, 0), base_gmv[pp]) for pp in periods}
+        vals = {pp: scaled_reason_val(nf_oth_gmv[pp].get(r, 0), nf_oth_total[pp], d['NF_Others'][pp]) for pp in periods}
         p(line(r, vals))
     p()
     p(line('Tech_Red', d['Tech_Red_sub']))
     p(line('EDD changed - w/o batch generation - Tech Led', d['EDD_Tech']))
     p(line('Redispatch', d['Redispatch']))
-    p(line('REPROCESS_WH_MH_CHANGE', d['REPROCESS']))
+    p(line('Others', d['TR_Others']))
     p()
     p(f"{'Tech_Red Others (till 95%):':>45}")
     for r in tr_oth_reasons:
-        vals = {pp: pct(tr_others_by_reason[pp].get(r, 0), base_gmv[pp]) for pp in periods}
+        vals = {pp: scaled_reason_val(tr_oth_gmv[pp].get(r, 0), tr_oth_total[pp], d['TR_Others'][pp]) for pp in periods}
         p(line(r, vals))
     p()
     p(line('WH Red', d['WH_Red']))
@@ -234,10 +214,14 @@ def run(args):
     p(line('Dispatch Miss_Overall', d['Dispatch']))
     p(sep)
 
-    # Save
+    # Save prompt
     outdir = config['output_dir']
     os.makedirs(outdir, exist_ok=True)
     outfile = os.path.join(outdir, f"tech_nf_red_analysis_{cutoff.strftime('%b%d').lower()}.txt")
-    with open(outfile, 'w') as f:
-        f.write('\n'.join(output) + '\n')
-    p(f"\nSaved to: {outfile}")
+    save = input(f"\nSave to {outfile}? (y/n): ").strip().lower()
+    if save == 'y':
+        with open(outfile, 'w') as f:
+            f.write('\n'.join(output) + '\n')
+        print(f"Saved to: {outfile}")
+    else:
+        print("Not saved.")
