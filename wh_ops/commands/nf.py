@@ -1,6 +1,7 @@
 """Tech NF + Tech Red + WH Red bucket analysis.
 
-Reads header values directly from New_Summary sheet rows.
+Reads sub-bucket values from New_Summary sheet rows.
+Overall Red and Tech Red are COMPUTED from sub-buckets (not read from sheet).
 Cancellation reason drilldowns from FC_DOD_RAW_NEW (till 95% cumulative).
 Always prints the summary table to stdout.
 """
@@ -17,8 +18,8 @@ WH_NF_REASONS = {'NOT_FOUND', 'AUDITED_SKU_NF'}
 MAIN_NF_BUCKETS = {'INVENTORY_SYNC_ERROR', 'REDISPATCHED_INVENTORY_OOS'}
 
 # New_Summary row indices (0-indexed in the full sheet array)
+# NOTE: Do NOT use Overall_RED (row 85) — it doesn't match sub-bucket sum
 ROWS = {
-    'Overall_RED': 85,
     'Tech_Red_sub': 133,
     'WH_Red': 93,
     'INV_SYNC': 52,
@@ -26,9 +27,7 @@ ROWS = {
     'STN_ADMIN_NF': 68,
     'NF_Others': 76,
     'EDD_Tech': 141,
-    'SI_FR': 149,
     'Redispatch': 157,
-    'TR_Others': 165,
     'REPROCESS': 173,
     'EDD_WH': 101,
     'Pick': 109,
@@ -96,13 +95,14 @@ def run(args):
     summary_rows = read_sheet(service, sid, 'New_Summary!A1:AO200', 'UNFORMATTED_VALUE')
     print(f"  New_Summary: {len(summary_rows)} rows")
 
-    # Extract all header values from New_Summary
+    # Extract sub-bucket values from New_Summary
+    periods = ['apr', 'apr_mtd', 'may', 'may_l7']
     d = {k: get_4cols(summary_rows, v) for k, v in ROWS.items()}
 
-    # Computed rows (no direct row in sheet)
-    periods = ['apr', 'apr_mtd', 'may', 'may_l7']
+    # COMPUTED rows (MUST compute from sub-buckets, not read from sheet)
     tech_nf = {p: d['INV_SYNC'][p] + d['REDISP_OOS'][p] + d['STN_ADMIN_NF'][p] + d['NF_Others'][p] for p in periods}
     tech_red = {p: tech_nf[p] + d['Tech_Red_sub'][p] for p in periods}
+    overall_red = {p: tech_red[p] + d['WH_Red'][p] for p in periods}
 
     # --- Read FC_DOD_RAW_NEW for cancellation reasons ---
     print("Reading FC_DOD_RAW_NEW (chunked)...")
@@ -112,7 +112,7 @@ def run(args):
             r.append('')
     print(f"  FC_DOD: {len(fc_data)} rows")
 
-    # Read RAW for base_gmv (needed for FC_DOD reason %) 
+    # Read RAW for base_gmv (needed for FC_DOD reason %)
     print("Reading RAW...")
     raw_all = read_sheet(service, sid, 'RAW!A1:W1600', 'UNFORMATTED_VALUE')
     raw_data = raw_all[1:] if len(raw_all) > 1 else []
@@ -198,14 +198,14 @@ def run(args):
                 f" {fmt(vals['may']):>12} {fmt(vals['may_l7']):>12}")
 
     p('=' * 100)
-    p('TECH NF + TECH RED + WH RED — Bucket Analysis')
+    p('TECH NF + TECH RED + WH RED \u2014 Bucket Analysis')
     p(f'MTD till {cutoff.strftime("%b %d")} | L7 = {cutoff.strftime("%b")} {l7_start}-{cutoff_day}')
     p('=' * 100)
     p()
     p(f"{'':>45} {'Apr-26':>12} {'Apr_MTD':>12} {'May_MTD':>12} {'May_L7':>12}")
-    sep = chr(9472) * 95
+    sep = '\u2500' * 95
     p(sep)
-    p(line('Overall Red', d['Overall_RED']))
+    p(line('Overall Red', overall_red))
     p(line('Tech Red', tech_red))
     p(line('Tech NF', tech_nf))
     p(line('INVENTORY_SYNC_ERROR', d['INV_SYNC']))
